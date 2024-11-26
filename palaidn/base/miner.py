@@ -14,6 +14,7 @@ from contextlib import contextmanager
 import requests
 import uuid
 import time
+from concurrent.futures import ThreadPoolExecutor , as_completed
 
 from substrateinterface import Keypair
 
@@ -357,9 +358,9 @@ class PalaidnMiner(BaseNeuron):
             bt.logging.warning(
                 f"Received a synapse from a validator with lower subnet version ({synapse.subnet_version}) than yours ({self.subnet_version}). You can safely ignore this warning."
             )
-
+        start_time = time.time()
         transactions = self.trace_transactions(synapse.wallet_address)
-
+        bt.logging.trace(f"fetching data need time {time.time() - start_time}")
         current_time = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="minutes")
 
         bt.logging.info(f"Processing ...")
@@ -453,47 +454,63 @@ class PalaidnMiner(BaseNeuron):
         if not config:
             return []  # Return empty list if config failed to load
 
-        combined_transfers = []
-
-        # Iterate over each network in the configuration file
-        for network in config.get('networks', []):
-            # Define the URL based on the network
+        def fetch_transfer(network: Dict[str, Any], address_type: Any) -> Dict[str, Any]:
+            if not network.get('name'):
+                bt.logging.error("Network configuration missing 'name' field")
+                return {}
+            # Iterate over each network in the configuration file
+                # Define the URL based on the network
             if network['name'] == 'ethereum':
                 url = f"https://eth-mainnet.g.alchemy.com/v2/{self.alchemy_api_key}"
             elif network['name'] == 'polygon':
                 url = f"https://polygon-mainnet.g.alchemy.com/v2/{self.alchemy_api_key}"
             else:
                 bt.logging.error(f"Unsupported network: {network['name']}")
-                continue
-
-            # Construct the headers and payload for the Alchemy API call
+                # Construct the headers and payload for the Alchemy API call
             headers = {
                 'Content-Type': 'application/json'
-            }
+                }
             payload = {
                 "jsonrpc": "2.0",
                 "method": "alchemy_getAssetTransfers",
                 "params": [{
                     "fromBlock": "0x0",
                     "toBlock": "latest",
-                    "fromAddress": wallet_address,
-                    "category": network.get('category', []),  # Use the category from the config
+                    address_type: wallet_address,
+                    "category": network.get('category', ["external","erc20", "erc721", "erc1155","specialnft"]),  # Use the category from the config
                     "withMetadata": True,
                     "excludeZeroValue": True
                 }],
                 "id": 1
             }
 
-            # Make the POST request
+                # Make the POST request
             try:
                 response = requests.post(url, json=payload, headers=headers)
                 response.raise_for_status()  # Raises an HTTPError for bad responses
                 data = response.json()
-                transfers = data.get('result', {}).get('transfers', [])
-                combined_transfers.extend(transfers)
+                return data.get('result', {}).get('transfers', [])
             except requests.exceptions.RequestException as e:
                 bt.logging.error(f"Request error for network {network['name']}: {e}")
             except Exception as e:
                 bt.logging.error(f"Unexpected error during API call for {network['name']}: {e}")
+            return []
+        
+        combined_transfers = []
+        networks = config.get('networks', [])
+
+        with ThreadPoolExecutor(max_workers=len(networks)*2) as executor :
+            future_context= {
+                executor.submit(fetch_transfer, network, address_type): (network, address_type)
+                for network in networks
+                for address_type in ['fromAddress', 'toAddress']
+            }
+            for future in as_completed(future_context):
+                try:
+                    transfers = future.result()
+                    combined_transfers.extend(transfers)
+                except Exception as e:
+                    network, address_type = future_context[future]
+                    bt.logging.error(f"Error processing {address_type} for network {network['name']}: {e}")
 
         return combined_transfers
